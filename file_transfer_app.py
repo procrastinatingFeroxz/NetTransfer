@@ -357,7 +357,7 @@ class FileTransferApp:
             self.status_label.config(text="Connecting...", fg="#fbbf24")
             
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
+            sock.settimeout(30)  # Increased timeout for receiver to respond
             sock.connect((recipient_ip, 5555))
             
             # Prepare file info
@@ -385,6 +385,17 @@ class FileTransferApp:
             sock.send(struct.pack("!I", len(file_info)))
             sock.send(file_info.encode())
             
+            # Wait for receiver acceptance
+            self.status_label.config(text="Waiting for receiver...", fg="#fbbf24")
+            response = sock.recv(1024).decode()
+            
+            if response != "ACCEPT":
+                sock.close()
+                if temp_zip_path and os.path.exists(temp_zip_path):
+                    os.unlink(temp_zip_path)
+                self.status_label.config(text="Transfer declined by receiver", fg="#888888")
+                return
+            
             # Send file data
             display_name = f"folder '{original_name}'" if is_folder else f"file '{filename}'"
             self.status_label.config(text=f"Sending {display_name}...", fg="#fbbf24")
@@ -397,14 +408,21 @@ class FileTransferApp:
                     sock.send(data)
                     sent += len(data)
             
+            # Wait for completion confirmation
+            self.status_label.config(text="Waiting for confirmation...", fg="#fbbf24")
+            confirmation = sock.recv(1024).decode()
+            
             sock.close()
             
             # Clean up temp zip
             if temp_zip_path and os.path.exists(temp_zip_path):
                 os.unlink(temp_zip_path)
             
-            self.status_label.config(text="✓ Transfer successful!", fg="#4ade80")
-            messagebox.showinfo("Success", f"{'Folder' if is_folder else 'File'} sent to {recipient_ip}")
+            if confirmation == "SUCCESS":
+                self.status_label.config(text="✓ Transfer successful!", fg="#4ade80")
+                messagebox.showinfo("Success", f"{'Folder' if is_folder else 'File'} sent to {recipient_ip}")
+            else:
+                self.status_label.config(text="✗ Transfer failed on receiver", fg="#ef4444")
             
         except Exception as e:
             # Clean up temp zip on error
@@ -457,63 +475,83 @@ class FileTransferApp:
                 f"Receive {item_type} from {addr[0]}?\n\n{item_type.title()}: {display_name}\nSize: {filesize / 1024:.2f} KB"
             )
             
-            if result:
-                if is_folder:
-                    # Ask where to extract the folder
-                    extract_dir = filedialog.askdirectory(title="Select where to extract folder")
-                    if not extract_dir:
-                        client.close()
-                        return
+            if not result:
+                client.send("DECLINE".encode())
+                client.close()
+                return
+            
+            # Send acceptance
+            client.send("ACCEPT".encode())
+            
+            if is_folder:
+                # Ask where to extract the folder
+                extract_dir = filedialog.askdirectory(title="Select where to extract folder")
+                if not extract_dir:
+                    client.send("FAIL".encode())
+                    client.close()
+                    return
+                
+                # Receive zip file to temp location
+                temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+                temp_zip.close()
+                
+                with open(temp_zip.name, 'wb') as f:
+                    received = 0
+                    while received < filesize:
+                        data = client.recv(min(4096, filesize - received))
+                        if not data:
+                            break
+                        f.write(data)
+                        received += len(data)
+                
+                # Extract the zip file
+                try:
+                    with zipfile.ZipFile(temp_zip.name, 'r') as zipf:
+                        zipf.extractall(extract_dir)
                     
-                    # Receive zip file to temp location
-                    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-                    temp_zip.close()
+                    # Clean up temp zip
+                    os.unlink(temp_zip.name)
                     
-                    with open(temp_zip.name, 'wb') as f:
-                        received = 0
-                        while received < filesize:
-                            data = client.recv(min(4096, filesize - received))
-                            if not data:
-                                break
-                            f.write(data)
-                            received += len(data)
-                    
-                    # Extract the zip file
-                    try:
-                        with zipfile.ZipFile(temp_zip.name, 'r') as zipf:
-                            zipf.extractall(extract_dir)
-                        
-                        # Clean up temp zip
+                    final_path = os.path.join(extract_dir, original_name)
+                    client.send("SUCCESS".encode())
+                    messagebox.showinfo("Success", f"Folder extracted to:\n{final_path}")
+                except Exception as e:
+                    if os.path.exists(temp_zip.name):
                         os.unlink(temp_zip.name)
-                        
-                        final_path = os.path.join(extract_dir, original_name)
-                        messagebox.showinfo("Success", f"Folder extracted to:\n{final_path}")
-                    except Exception as e:
-                        os.unlink(temp_zip.name)
-                        messagebox.showerror("Error", f"Failed to extract folder: {str(e)}")
-                else:
-                    # Regular file handling
-                    save_path = filedialog.asksaveasfilename(
-                        defaultextension="",
-                        initialfile=filename,
-                        title="Save file as"
-                    )
-                    
-                    if save_path:
-                        with open(save_path, 'wb') as f:
-                            received = 0
-                            while received < filesize:
-                                data = client.recv(min(4096, filesize - received))
-                                if not data:
-                                    break
-                                f.write(data)
-                                received += len(data)
-                        
-                        messagebox.showinfo("Success", f"File received and saved to:\n{save_path}")
+                    client.send("FAIL".encode())
+                    messagebox.showerror("Error", f"Failed to extract folder: {str(e)}")
+            else:
+                # Regular file handling
+                save_path = filedialog.asksaveasfilename(
+                    defaultextension="",
+                    initialfile=filename,
+                    title="Save file as"
+                )
+                
+                if not save_path:
+                    client.send("FAIL".encode())
+                    client.close()
+                    return
+                
+                with open(save_path, 'wb') as f:
+                    received = 0
+                    while received < filesize:
+                        data = client.recv(min(4096, filesize - received))
+                        if not data:
+                            break
+                        f.write(data)
+                        received += len(data)
+                
+                client.send("SUCCESS".encode())
+                messagebox.showinfo("Success", f"File received and saved to:\n{save_path}")
             
             client.close()
             
         except Exception as e:
+            try:
+                client.send("FAIL".encode())
+            except:
+                pass
             messagebox.showerror("Error", f"Failed to receive: {str(e)}")
             client.close()
 
