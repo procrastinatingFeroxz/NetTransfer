@@ -6,6 +6,9 @@ import os
 import struct
 import json
 from datetime import datetime
+import zipfile
+import tempfile
+import shutil
 
 class FileTransferApp:
     def __init__(self, root):
@@ -188,8 +191,8 @@ class FileTransferApp:
         self.ip_entry.bind("<FocusIn>", self.show_device_dropdown)
         self.ip_entry.bind("<Button-1>", self.show_device_dropdown)
         
-        ttk.Label(send_frame, text="File to Send:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.file_label = tk.Label(send_frame, text="No file selected", bg="#3c3c3c", fg="#888888", 
+        ttk.Label(send_frame, text="File/Folder:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.file_label = tk.Label(send_frame, text="No file or folder selected", bg="#3c3c3c", fg="#888888", 
                                    width=30, anchor=tk.W, padx=5, font=("Arial", 9))
         self.file_label.grid(row=1, column=1, padx=10, pady=5, sticky=tk.W)
         
@@ -197,23 +200,37 @@ class FileTransferApp:
         button_frame = tk.Frame(self.root, bg="#2b2b2b")
         button_frame.pack(pady=20)
         
-        browse_btn = tk.Button(
+        browse_file_btn = tk.Button(
             button_frame,
-            text="📂 Browse File",
+            text="📄 Browse File",
             command=self.browse_file,
             bg="#4a90e2",
             fg="white",
             font=("Arial", 10, "bold"),
-            padx=20,
+            padx=15,
             pady=8,
             relief=tk.FLAT,
             cursor="hand2"
         )
-        browse_btn.pack(side=tk.LEFT, padx=10)
+        browse_file_btn.pack(side=tk.LEFT, padx=5)
+        
+        browse_folder_btn = tk.Button(
+            button_frame,
+            text="📁 Browse Folder",
+            command=self.browse_folder,
+            bg="#4a90e2",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=15,
+            pady=8,
+            relief=tk.FLAT,
+            cursor="hand2"
+        )
+        browse_folder_btn.pack(side=tk.LEFT, padx=5)
         
         send_btn = tk.Button(
             button_frame,
-            text="📤 Send File",
+            text="📤 Send",
             command=self.send_file,
             bg="#4ade80",
             fg="white",
@@ -223,7 +240,7 @@ class FileTransferApp:
             relief=tk.FLAT,
             cursor="hand2"
         )
-        send_btn.pack(side=tk.LEFT, padx=10)
+        send_btn.pack(side=tk.LEFT, padx=5)
         
         # Status
         self.status_label = tk.Label(
@@ -236,16 +253,43 @@ class FileTransferApp:
         self.status_label.pack(pady=10)
         
         self.selected_file = None
+        self.selected_folder = None
+        self.is_folder = False
     
     def browse_file(self):
         filename = filedialog.askopenfilename(title="Select a file to send")
         if filename:
             self.selected_file = filename
+            self.selected_folder = None
+            self.is_folder = False
             self.file_label.config(text=os.path.basename(filename), fg="white")
     
+    def browse_folder(self):
+        foldername = filedialog.askdirectory(title="Select a folder to send")
+        if foldername:
+            self.selected_folder = foldername
+            self.selected_file = None
+            self.is_folder = True
+            folder_name = os.path.basename(foldername)
+            self.file_label.config(text=f"📁 {folder_name}", fg="white")
+    
+    def zip_folder(self, folder_path):
+        """Create a temporary zip file of the folder"""
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_zip.close()
+        
+        with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, os.path.dirname(folder_path))
+                    zipf.write(file_path, arcname)
+        
+        return temp_zip.name
+    
     def send_file(self):
-        if not self.selected_file:
-            messagebox.showwarning("No File", "Please select a file to send!")
+        if not self.selected_file and not self.selected_folder:
+            messagebox.showwarning("No Selection", "Please select a file or folder to send!")
             return
         
         recipient_ip = self.ip_entry.get().strip()
@@ -308,6 +352,7 @@ class FileTransferApp:
         thread.start()
     
     def _send_file_thread(self, recipient_ip):
+        temp_zip_path = None
         try:
             self.status_label.config(text="Connecting...", fg="#fbbf24")
             
@@ -315,17 +360,35 @@ class FileTransferApp:
             sock.settimeout(5)
             sock.connect((recipient_ip, 5555))
             
-            # Send file info
-            filename = os.path.basename(self.selected_file)
-            filesize = os.path.getsize(self.selected_file)
+            # Prepare file info
+            if self.is_folder:
+                # Zip the folder
+                self.status_label.config(text="Zipping folder...", fg="#fbbf24")
+                temp_zip_path = self.zip_folder(self.selected_folder)
+                file_to_send = temp_zip_path
+                original_name = os.path.basename(self.selected_folder)
+                filename = f"{original_name}.zip"
+                is_folder = True
+            else:
+                file_to_send = self.selected_file
+                filename = os.path.basename(self.selected_file)
+                is_folder = False
             
-            file_info = json.dumps({"filename": filename, "filesize": filesize})
+            filesize = os.path.getsize(file_to_send)
+            
+            file_info = json.dumps({
+                "filename": filename,
+                "filesize": filesize,
+                "is_folder": is_folder,
+                "original_name": original_name if is_folder else None
+            })
             sock.send(struct.pack("!I", len(file_info)))
             sock.send(file_info.encode())
             
             # Send file data
-            self.status_label.config(text=f"Sending {filename}...", fg="#fbbf24")
-            with open(self.selected_file, 'rb') as f:
+            display_name = f"folder '{original_name}'" if is_folder else f"file '{filename}'"
+            self.status_label.config(text=f"Sending {display_name}...", fg="#fbbf24")
+            with open(file_to_send, 'rb') as f:
                 sent = 0
                 while sent < filesize:
                     data = f.read(4096)
@@ -335,12 +398,21 @@ class FileTransferApp:
                     sent += len(data)
             
             sock.close()
-            self.status_label.config(text="✓ File sent successfully!", fg="#4ade80")
-            messagebox.showinfo("Success", f"File sent to {recipient_ip}")
+            
+            # Clean up temp zip
+            if temp_zip_path and os.path.exists(temp_zip_path):
+                os.unlink(temp_zip_path)
+            
+            self.status_label.config(text="✓ Transfer successful!", fg="#4ade80")
+            messagebox.showinfo("Success", f"{'Folder' if is_folder else 'File'} sent to {recipient_ip}")
             
         except Exception as e:
+            # Clean up temp zip on error
+            if temp_zip_path and os.path.exists(temp_zip_path):
+                os.unlink(temp_zip_path)
+            
             self.status_label.config(text="✗ Transfer failed", fg="#ef4444")
-            messagebox.showerror("Error", f"Failed to send file: {str(e)}")
+            messagebox.showerror("Error", f"Failed to send: {str(e)}")
     
     def start_server(self):
         self.server_running = True
@@ -374,22 +446,30 @@ class FileTransferApp:
             
             filename = file_info["filename"]
             filesize = file_info["filesize"]
+            is_folder = file_info.get("is_folder", False)
+            original_name = file_info.get("original_name", None)
             
             # Show popup
+            item_type = "folder" if is_folder else "file"
+            display_name = original_name if is_folder else filename
             result = messagebox.askyesno(
-                "Incoming File",
-                f"Receive file from {addr[0]}?\n\nFile: {filename}\nSize: {filesize / 1024:.2f} KB"
+                f"Incoming {item_type.title()}",
+                f"Receive {item_type} from {addr[0]}?\n\n{item_type.title()}: {display_name}\nSize: {filesize / 1024:.2f} KB"
             )
             
             if result:
-                save_path = filedialog.asksaveasfilename(
-                    defaultextension="",
-                    initialfile=filename,
-                    title="Save file as"
-                )
-                
-                if save_path:
-                    with open(save_path, 'wb') as f:
+                if is_folder:
+                    # Ask where to extract the folder
+                    extract_dir = filedialog.askdirectory(title="Select where to extract folder")
+                    if not extract_dir:
+                        client.close()
+                        return
+                    
+                    # Receive zip file to temp location
+                    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+                    temp_zip.close()
+                    
+                    with open(temp_zip.name, 'wb') as f:
                         received = 0
                         while received < filesize:
                             data = client.recv(min(4096, filesize - received))
@@ -398,12 +478,43 @@ class FileTransferApp:
                             f.write(data)
                             received += len(data)
                     
-                    messagebox.showinfo("Success", f"File received and saved to:\n{save_path}")
+                    # Extract the zip file
+                    try:
+                        with zipfile.ZipFile(temp_zip.name, 'r') as zipf:
+                            zipf.extractall(extract_dir)
+                        
+                        # Clean up temp zip
+                        os.unlink(temp_zip.name)
+                        
+                        final_path = os.path.join(extract_dir, original_name)
+                        messagebox.showinfo("Success", f"Folder extracted to:\n{final_path}")
+                    except Exception as e:
+                        os.unlink(temp_zip.name)
+                        messagebox.showerror("Error", f"Failed to extract folder: {str(e)}")
+                else:
+                    # Regular file handling
+                    save_path = filedialog.asksaveasfilename(
+                        defaultextension="",
+                        initialfile=filename,
+                        title="Save file as"
+                    )
+                    
+                    if save_path:
+                        with open(save_path, 'wb') as f:
+                            received = 0
+                            while received < filesize:
+                                data = client.recv(min(4096, filesize - received))
+                                if not data:
+                                    break
+                                f.write(data)
+                                received += len(data)
+                        
+                        messagebox.showinfo("Success", f"File received and saved to:\n{save_path}")
             
             client.close()
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to receive file: {str(e)}")
+            messagebox.showerror("Error", f"Failed to receive: {str(e)}")
             client.close()
 
 if __name__ == "__main__":
